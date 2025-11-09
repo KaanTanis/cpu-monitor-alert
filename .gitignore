@@ -1,5 +1,4 @@
 *.log
-*.txt
 .env
 subscribers.txt
 diagnostic_*.txt

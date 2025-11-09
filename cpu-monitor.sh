@@ -2,7 +2,7 @@
 
 ##############################################
 # CPU Monitor - Telegram Bildirimleri
-# CPU belirli yüzdeyi aşarsa Telegram'a bildirim gönderir
+# CPU belirli yüzdeyi aşarsa Telegram botuna bildirim gönderir
 ##############################################
 
 # Konfigürasyon
@@ -90,35 +90,67 @@ check_password() {
 process_telegram_updates() {
     [ -z "$TELEGRAM_BOT_TOKEN" ] && return 1
     
-    local last_offset=$(cat "$LAST_OFFSET_FILE" 2>/dev/null || echo "0")
-    local updates=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=$last_offset&timeout=1")
-    
-    [ -z "$updates" ] && return 1
-    
-    # jq kullanarak mesajları parse et
+    # jq kontrolü
     if ! command -v jq >/dev/null 2>&1; then
         log "jq bulunamadı. 'apt-get install jq' veya 'yum install jq' ile yükleyin."
         return 1
     fi
     
-    # Process substitution kullanarak max_update_id'yi dışarıda tutabiliriz
-    local max_update_id=0
+    local last_offset=$(cat "$LAST_OFFSET_FILE" 2>/dev/null || echo "0")
+    local updates=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=$last_offset&timeout=5")
+    
+    # API yanıtını kontrol et
+    if [ -z "$updates" ]; then
+        return 1
+    fi
+    
+    # API hatası kontrolü
+    if echo "$updates" | jq -e '.ok == false' >/dev/null 2>&1; then
+        local error_desc=$(echo "$updates" | jq -r '.description // "Unknown error"' 2>/dev/null)
+        log "Telegram API hatası: $error_desc"
+        return 1
+    fi
+    
+    # Update sayısını kontrol et
+    local update_count=$(echo "$updates" | jq '.result | length' 2>/dev/null)
+    if [ -z "$update_count" ] || [ "$update_count" = "0" ]; then
+        return 0
+    fi
+    
+    local max_update_id=$last_offset
     local temp_file=$(mktemp)
     
-    echo "$updates" | jq -r '.result[]? | "\(.update_id)|\(.message.chat.id // "")|\(.message.text // "")"' > "$temp_file"
+    # Mesajları parse et
+    echo "$updates" | jq -r '.result[]? | "\(.update_id)|\(.message.chat.id // "")|\(.message.text // "")"' > "$temp_file" 2>/dev/null
+    
+    if [ ! -s "$temp_file" ]; then
+        rm -f "$temp_file"
+        return 0
+    fi
     
     while IFS='|' read -r update_id chat_id text; do
         [ -z "$update_id" ] && continue
-        [ "$update_id" -gt "$max_update_id" ] && max_update_id=$update_id
+        
+        # Max update ID'yi güncelle
+        if [ "$update_id" -gt "$max_update_id" ]; then
+            max_update_id=$update_id
+        fi
+        
         [ -z "$chat_id" ] || [ -z "$text" ] && continue
         
         # /start komutu
         if [ "$text" = "/start" ]; then
             local response_msg="🔐 <b>Şifre Gerekli</b><br><br>Bildirimlere abone olmak için şifreyi girin:<br><code>/password ŞİFRE</code>"
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            local response=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d chat_id="$chat_id" \
                 -d text="$response_msg" \
-                -d parse_mode="HTML" >/dev/null 2>&1
+                -d parse_mode="HTML")
+            
+            if echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+                log "Yeni /start komutu alındı: $chat_id"
+            else
+                log "Mesaj gönderilemedi (chat_id: $chat_id)"
+            fi
             continue
         fi
         
@@ -143,6 +175,7 @@ process_telegram_updates() {
                     -d chat_id="$chat_id" \
                     -d text="$error_msg" \
                     -d parse_mode="HTML" >/dev/null 2>&1
+                log "Hatalı şifre denemesi: $chat_id"
             fi
             continue
         fi
@@ -169,10 +202,12 @@ process_telegram_updates() {
     
     rm -f "$temp_file"
     
-    # Offset'i güncelle
+    # Offset'i güncelle (bir sonraki update için)
     if [ "$max_update_id" -gt 0 ]; then
         echo $((max_update_id + 1)) > "$LAST_OFFSET_FILE"
     fi
+    
+    return 0
 }
 
 # Diagnostic raporu oluştur
@@ -254,15 +289,10 @@ main() {
     
     consecutive_high=0
     last_alert_time=0
-    update_check_counter=0
     
     while true; do
-        # Telegram mesajlarını kontrol et (her 10 döngüde bir)
-        update_check_counter=$((update_check_counter + 1))
-        if [ $update_check_counter -ge 10 ]; then
-            process_telegram_updates
-            update_check_counter=0
-        fi
+        # Telegram mesajlarını kontrol et (her döngüde - yaklaşık 10 saniyede bir)
+        process_telegram_updates
         
         # CPU kullanımını kontrol et
         cpu_usage=$(get_cpu_usage)
