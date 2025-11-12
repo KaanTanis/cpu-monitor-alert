@@ -81,9 +81,18 @@ check_password() {
     if [ ! -f "$PASSWORD_FILE" ]; then
         echo "1234" > "$PASSWORD_FILE"
         chmod 600 "$PASSWORD_FILE"
+        log "Şifre dosyası oluşturuldu: $PASSWORD_FILE (varsayılan: 1234)"
     fi
     local stored_password=$(cat "$PASSWORD_FILE" | tr -d '\n\r ')
-    [ "$password" = "$stored_password" ]
+    
+    # Debug: Şifre karşılaştırması (şifreleri loglamadan)
+    if [ "$password" = "$stored_password" ]; then
+        log "Şifre eşleşti: password_length=${#password}, stored_length=${#stored_password}"
+        return 0
+    else
+        log "Şifre eşleşmedi: password_length=${#password}, stored_length=${#stored_password}"
+        return 1
+    fi
 }
 
 # Telegram mesajlarını işle (PIN kontrolü ile)
@@ -196,7 +205,12 @@ process_telegram_updates() {
             continue
         fi
         
-        log "Mesaj işleniyor: update_id=$update_id, chat_id=$chat_id, text=$text"
+        log "Mesaj işleniyor: update_id=$update_id, chat_id=$chat_id, text='$text'"
+        
+        # Bilinmeyen komutlar için log
+        if [ -n "$text" ] && echo "$text" | grep -q "^/"; then
+            log "Komut tespit edildi: text='$text'"
+        fi
         
         # /start komutu (bot kullanıcı adı ile veya sadece /start)
         if echo "$text" | grep -q "^/start"; then
@@ -223,28 +237,79 @@ Bildirimlere abone olmak için şifreyi girin:
             continue
         fi
         
-        # /password komutu
-        if echo "$text" | grep -q "^/password "; then
-            local provided_password=$(echo "$text" | sed 's/^\/password //' | tr -d '\n\r ')
+        # /password komutu (bot kullanıcı adı ile veya sadece /password)
+        if echo "$text" | grep -qE "^/password(@[^ ]+)? "; then
+            log "Password komutu alındı: chat_id=$chat_id, text=$text"
             
+            # Şifreyi çıkar (bot kullanıcı adını da kaldır)
+            local provided_password=$(echo "$text" | sed -E 's/^\/password(@[^ ]+)? //' | tr -d '\n\r ')
+            
+            log "Şifre kontrol ediliyor: chat_id=$chat_id, password_length=${#provided_password}"
+            
+            # Şifre dosyasını kontrol et
+            if [ ! -f "$PASSWORD_FILE" ]; then
+                log "UYARI: Şifre dosyası yok, varsayılan şifre oluşturuluyor: $PASSWORD_FILE"
+                echo "1234" > "$PASSWORD_FILE"
+                chmod 600 "$PASSWORD_FILE"
+            fi
+            
+            # Şifreyi kontrol et
             if check_password "$provided_password"; then
+                log "✓ Şifre doğru: chat_id=$chat_id"
+                
+                # Abone listesine ekle
                 if ! grep -q "^${chat_id}$" "$SUBSCRIBERS_FILE" 2>/dev/null; then
                     echo "$chat_id" >> "$SUBSCRIBERS_FILE"
-                    log "Yeni abone: $chat_id"
+                    log "Yeni abone eklendi: $chat_id"
+                else
+                    log "Kullanıcı zaten abone: $chat_id"
                 fi
                 
-                local success_msg="✅ <b>Başarılı!</b><br><br>CPU bildirimlerine abone oldunuz.<br><b>Sunucu:</b> $(hostname)<br><b>Eşik:</b> ${CPU_THRESHOLD}%"
-                curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                # Başarı mesajı gönder
+                local success_msg="✅ <b>Başarılı!</b>
+
+CPU bildirimlerine abone oldunuz.
+<b>Sunucu:</b> $(hostname)
+<b>Eşik:</b> ${CPU_THRESHOLD}%"
+                
+                local response=$(curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                     -d chat_id="$chat_id" \
                     -d text="$success_msg" \
-                    -d parse_mode="HTML" >/dev/null 2>&1
+                    -d parse_mode="HTML" 2>&1)
+                
+                if echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+                    log "✓ Başarı mesajı gönderildi: chat_id=$chat_id"
+                else
+                    local error_code=$(echo "$response" | jq -r '.error_code // "unknown"' 2>/dev/null)
+                    local error_msg=$(echo "$response" | jq -r '.description // "Unknown error"' 2>/dev/null)
+                    log "✗ Başarı mesajı gönderilemedi (chat_id: $chat_id, error_code: $error_code, error: $error_msg)"
+                    if [ -n "$response" ]; then
+                        log "Response: $response"
+                    fi
+                fi
             else
-                local error_msg="❌ <b>Hatalı Şifre</b><br><br>Girdiğiniz şifre yanlış. Lütfen tekrar deneyin."
-                curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                log "✗ Hatalı şifre: chat_id=$chat_id"
+                
+                # Hata mesajı gönder
+                local error_msg="❌ <b>Hatalı Şifre</b>
+
+Girdiğiniz şifre yanlış. Lütfen tekrar deneyin."
+                
+                local response=$(curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                     -d chat_id="$chat_id" \
                     -d text="$error_msg" \
-                    -d parse_mode="HTML" >/dev/null 2>&1
-                log "Hatalı şifre denemesi: $chat_id"
+                    -d parse_mode="HTML" 2>&1)
+                
+                if echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+                    log "✓ Hata mesajı gönderildi: chat_id=$chat_id"
+                else
+                    local error_code=$(echo "$response" | jq -r '.error_code // "unknown"' 2>/dev/null)
+                    local error_desc=$(echo "$response" | jq -r '.description // "Unknown error"' 2>/dev/null)
+                    log "✗ Hata mesajı gönderilemedi (chat_id: $chat_id, error_code: $error_code, error: $error_desc)"
+                    if [ -n "$response" ]; then
+                        log "Response: $response"
+                    fi
+                fi
             fi
             continue
         fi
