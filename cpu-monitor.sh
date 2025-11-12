@@ -88,43 +88,98 @@ check_password() {
 
 # Telegram mesajlarını işle (PIN kontrolü ile)
 process_telegram_updates() {
-    [ -z "$TELEGRAM_BOT_TOKEN" ] && return 1
+    if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+        log "UYARI: TELEGRAM_BOT_TOKEN boş! Telegram mesajları işlenemiyor."
+        return 1
+    fi
     
     # jq kontrolü
     if ! command -v jq >/dev/null 2>&1; then
-        log "jq bulunamadı. 'apt-get install jq' veya 'yum install jq' ile yükleyin."
+        log "HATA: jq bulunamadı. 'apt-get install jq' veya 'brew install jq' ile yükleyin."
         return 1
     fi
     
     local last_offset=$(cat "$LAST_OFFSET_FILE" 2>/dev/null || echo "0")
-    local updates=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=$last_offset&timeout=5")
+    
+    # getUpdates çağrısı - daha kısa timeout ve hata kontrolü
+    local updates=$(curl -s --max-time 10 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=$last_offset&timeout=5" 2>&1)
+    local curl_exit_code=$?
+    
+    # Curl hatası kontrolü
+    if [ $curl_exit_code -ne 0 ]; then
+        log "Curl hatası (exit code: $curl_exit_code): $updates"
+        return 1
+    fi
     
     # API yanıtını kontrol et
     if [ -z "$updates" ]; then
+        log "UYARI: getUpdates boş yanıt döndü"
+        return 1
+    fi
+    
+    # JSON geçerliliği kontrolü
+    if ! echo "$updates" | jq . >/dev/null 2>&1; then
+        log "HATA: getUpdates geçersiz JSON döndü: $updates"
         return 1
     fi
     
     # API hatası kontrolü
     if echo "$updates" | jq -e '.ok == false' >/dev/null 2>&1; then
+        local error_code=$(echo "$updates" | jq -r '.error_code // "unknown"' 2>/dev/null)
         local error_desc=$(echo "$updates" | jq -r '.description // "Unknown error"' 2>/dev/null)
-        log "Telegram API hatası: $error_desc"
+        log "Telegram API hatası (code: $error_code): $error_desc"
+        return 1
+    fi
+    
+    # OK kontrolü
+    if ! echo "$updates" | jq -e '.ok == true' >/dev/null 2>&1; then
+        log "HATA: getUpdates beklenmeyen yanıt: $updates"
         return 1
     fi
     
     # Update sayısını kontrol et
     local update_count=$(echo "$updates" | jq '.result | length' 2>/dev/null)
     if [ -z "$update_count" ] || [ "$update_count" = "0" ]; then
+        # Update yok, bu normal - sessizce devam et
         return 0
+    fi
+    
+    log "Telegram update alındı: $update_count adet (offset: $last_offset)"
+    
+    # Debug: İlk update'i logla
+    if [ "$update_count" -gt 0 ]; then
+        local first_update=$(echo "$updates" | jq '.result[0]' 2>/dev/null)
+        log "İlk update detayı: $first_update"
     fi
     
     local max_update_id=$last_offset
     local temp_file=$(mktemp)
     
-    # Mesajları parse et
-    echo "$updates" | jq -r '.result[]? | "\(.update_id)|\(.message.chat.id // "")|\(.message.text // "")"' > "$temp_file" 2>/dev/null
+    # Mesajları parse et - hem message.text hem de edited_message.text'i kontrol et
+    echo "$updates" | jq -r '.result[]? | 
+        if .message then
+            "\(.update_id)|\(.message.chat.id // "")|\(.message.text // "")"
+        elif .edited_message then
+            "\(.update_id)|\(.edited_message.chat.id // "")|\(.edited_message.text // "")"
+        else
+            empty
+        end' > "$temp_file" 2>&1
+    
+    # jq parsing hatası kontrolü
+    if [ $? -ne 0 ]; then
+        local jq_error=$(cat "$temp_file" 2>/dev/null)
+        log "HATA: jq parsing hatası: $jq_error"
+        rm -f "$temp_file"
+        return 1
+    fi
     
     if [ ! -s "$temp_file" ]; then
         rm -f "$temp_file"
+        # Update var ama mesaj yok, yine de offset'i güncelle
+        local max_id=$(echo "$updates" | jq -r '[.result[].update_id] | max // 0' 2>/dev/null)
+        if [ "$max_id" -gt 0 ]; then
+            echo $((max_id + 1)) > "$LAST_OFFSET_FILE"
+        fi
         return 0
     fi
     
@@ -136,20 +191,34 @@ process_telegram_updates() {
             max_update_id=$update_id
         fi
         
-        [ -z "$chat_id" ] || [ -z "$text" ] && continue
+        # Chat ID veya text yoksa atla
+        if [ -z "$chat_id" ] || [ -z "$text" ]; then
+            continue
+        fi
         
-        # /start komutu
-        if [ "$text" = "/start" ]; then
-            local response_msg="🔐 <b>Şifre Gerekli</b><br><br>Bildirimlere abone olmak için şifreyi girin:<br><code>/password ŞİFRE</code>"
-            local response=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        log "Mesaj işleniyor: update_id=$update_id, chat_id=$chat_id, text=$text"
+        
+        # /start komutu (bot kullanıcı adı ile veya sadece /start)
+        if echo "$text" | grep -q "^/start"; then
+            log "Start komutu alındı: chat_id=$chat_id, text=$text"
+            local response_msg="🔐 <b>Şifre Gerekli</b>
+
+Bildirimlere abone olmak için şifreyi girin:
+<code>/password ŞİFRE</code>"
+            local response=$(curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d chat_id="$chat_id" \
                 -d text="$response_msg" \
-                -d parse_mode="HTML")
+                -d parse_mode="HTML" 2>&1)
             
             if echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
-                log "Yeni /start komutu alındı: $chat_id"
+                log "✓ Start mesajı başarıyla gönderildi: chat_id=$chat_id"
             else
-                log "Mesaj gönderilemedi (chat_id: $chat_id)"
+                local error_code=$(echo "$response" | jq -r '.error_code // "unknown"' 2>/dev/null)
+                local error_msg=$(echo "$response" | jq -r '.description // "Unknown error"' 2>/dev/null)
+                log "✗ Mesaj gönderilemedi (chat_id: $chat_id, error_code: $error_code, error: $error_msg)"
+                if [ -n "$response" ]; then
+                    log "Response: $response"
+                fi
             fi
             continue
         fi
@@ -203,8 +272,21 @@ process_telegram_updates() {
     rm -f "$temp_file"
     
     # Offset'i güncelle (bir sonraki update için)
-    if [ "$max_update_id" -gt 0 ]; then
-        echo $((max_update_id + 1)) > "$LAST_OFFSET_FILE"
+    # max_update_id hala last_offset'a eşitse, tüm update'lerin ID'lerini kontrol et
+    if [ "$max_update_id" -eq "$last_offset" ] || [ "$max_update_id" -lt "$last_offset" ]; then
+        # Tüm update ID'lerini al ve max'ı bul
+        local all_update_ids=$(echo "$updates" | jq -r '.result[].update_id' 2>/dev/null)
+        if [ -n "$all_update_ids" ]; then
+            max_update_id=$(echo "$all_update_ids" | sort -n | tail -1)
+        fi
+    fi
+    
+    if [ -n "$max_update_id" ] && [ "$max_update_id" -gt 0 ]; then
+        local new_offset=$((max_update_id + 1))
+        echo "$new_offset" > "$LAST_OFFSET_FILE"
+        if [ "$new_offset" -ne "$((last_offset + 1))" ] && [ "$max_update_id" -ne "$last_offset" ]; then
+            log "Offset güncellendi: $last_offset -> $new_offset (max_update_id: $max_update_id)"
+        fi
     fi
     
     return 0
@@ -271,12 +353,43 @@ create_alert_message() {
     echo "$message"
 }
 
+# Telegram bot bağlantısını test et
+test_telegram_connection() {
+    if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+        log "HATA: TELEGRAM_BOT_TOKEN boş!"
+        return 1
+    fi
+    
+    log "Telegram bot bağlantısı test ediliyor..."
+    local test_response=$(curl -s --max-time 10 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>&1)
+    
+    if echo "$test_response" | jq -e '.ok == true' >/dev/null 2>&1; then
+        local bot_username=$(echo "$test_response" | jq -r '.result.username // "unknown"' 2>/dev/null)
+        local bot_name=$(echo "$test_response" | jq -r '.result.first_name // "unknown"' 2>/dev/null)
+        log "✓ Telegram bot bağlantısı başarılı: @$bot_username ($bot_name)"
+        return 0
+    else
+        local error_code=$(echo "$test_response" | jq -r '.error_code // "unknown"' 2>/dev/null)
+        local error_desc=$(echo "$test_response" | jq -r '.description // "Unknown error"' 2>/dev/null)
+        log "✗ Telegram bot bağlantısı başarısız (error_code: $error_code, error: $error_desc)"
+        log "Test response: $test_response"
+        return 1
+    fi
+}
+
 # Ana monitoring döngüsü
 main() {
     log "CPU Monitor başlatılıyor (Eşik: ${CPU_THRESHOLD}%)"
     
     if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
         log "HATA: Telegram bot token ayarlanmamış!"
+        log "Lütfen cpu-monitor.sh dosyasında TELEGRAM_BOT_TOKEN değişkenini ayarlayın."
+        exit 1
+    fi
+    
+    # Telegram bağlantısını test et
+    if ! test_telegram_connection; then
+        log "HATA: Telegram bot bağlantısı başarısız. Script durduruluyor."
         exit 1
     fi
     
@@ -287,8 +400,19 @@ main() {
         log "Varsayılan şifre oluşturuldu: 1234 (telegram_password.txt dosyasını düzenleyin)"
     fi
     
+    # Offset dosyasını kontrol et
+    if [ ! -f "$LAST_OFFSET_FILE" ]; then
+        echo "0" > "$LAST_OFFSET_FILE"
+        log "Offset dosyası oluşturuldu (başlangıç: 0)"
+    else
+        local current_offset=$(cat "$LAST_OFFSET_FILE" 2>/dev/null || echo "0")
+        log "Mevcut offset: $current_offset"
+    fi
+    
     consecutive_high=0
     last_alert_time=0
+    
+    log "Monitoring başlatıldı. Telegram mesajları dinleniyor..."
     
     while true; do
         # Telegram mesajlarını kontrol et (her döngüde - yaklaşık 10 saniyede bir)
