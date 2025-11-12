@@ -5,14 +5,86 @@
 # CPU eşik değerini aştığında detaylı rapor gönderir
 ##############################################
 
-# Konfigürasyon
-CPU_THRESHOLD=95
-CHECK_INTERVAL=10
-SECRET_KEY="your_secret_key_here"  # Bu anahtarı değiştirin
-TELEGRAM_BOT_TOKEN=""
+# Script dizinini belirle
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config.conf"
+
+# Varsayılan değerler
+DEFAULT_CPU_THRESHOLD=95
+DEFAULT_CHECK_INTERVAL=10
+DEFAULT_CONSECUTIVE_CHECKS=3
+DEFAULT_ALERT_INTERVAL=300
+DEFAULT_LOG_RETENTION_DAYS=7
+DEFAULT_SECRET_KEY="your_secret_key_here"
+DEFAULT_TELEGRAM_BOT_TOKEN=""
+
+# Config dosyasını oluştur veya oku
+create_default_config() {
+    cat > "$CONFIG_FILE" << EOF
+# CPU Monitor Konfigürasyonuchmod +x cpu-monitor.sh
+# Bu dosyayı düzenleyerek ayarları değiştirebilirsiniz
+
+# Telegram Bot Token (zorunlu)
+TELEGRAM_BOT_TOKEN=$DEFAULT_TELEGRAM_BOT_TOKEN
+
+# Abonelik için gizli anahtar (zorunlu - mutlaka değiştirin!)
+SECRET_KEY=$DEFAULT_SECRET_KEY
+
+# CPU eşik değeri (%)
+CPU_THRESHOLD=$DEFAULT_CPU_THRESHOLD
+
+# Kontrol aralığı (saniye)
+CHECK_INTERVAL=$DEFAULT_CHECK_INTERVAL
+
+# Arka arkaya kaç kez eşiği geçerse uyarı versin
+CONSECUTIVE_CHECKS=$DEFAULT_CONSECUTIVE_CHECKS
+
+# Uyarılar arası minimum süre (saniye) - Eşik geçildiği sürece bu süre sonunda yeni rapor gönderir
+ALERT_INTERVAL=$DEFAULT_ALERT_INTERVAL
+
+# Log dosyalarını kaç gün saklasın
+LOG_RETENTION_DAYS=$DEFAULT_LOG_RETENTION_DAYS
+EOF
+    echo "Varsayılan config dosyası oluşturuldu: $CONFIG_FILE"
+    echo "Lütfen TELEGRAM_BOT_TOKEN ve SECRET_KEY değerlerini düzenleyin!"
+}
+
+# Config dosyasını yükle
+load_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        create_default_config
+        exit 1
+    fi
+    
+    # Config dosyasını source et
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    
+    # Zorunlu değerleri kontrol et
+    if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ "$TELEGRAM_BOT_TOKEN" = "$DEFAULT_TELEGRAM_BOT_TOKEN" ]; then
+        echo "HATA: TELEGRAM_BOT_TOKEN ayarlanmamış!"
+        echo "Lütfen $CONFIG_FILE dosyasını düzenleyin."
+        exit 1
+    fi
+    
+    if [ -z "$SECRET_KEY" ] || [ "$SECRET_KEY" = "$DEFAULT_SECRET_KEY" ]; then
+        echo "HATA: SECRET_KEY varsayılan değerde!"
+        echo "Lütfen $CONFIG_FILE dosyasında SECRET_KEY değerini değiştirin."
+        exit 1
+    fi
+    
+    # Varsayılan değerleri ata (config'de yoksa)
+    CPU_THRESHOLD=${CPU_THRESHOLD:-$DEFAULT_CPU_THRESHOLD}
+    CHECK_INTERVAL=${CHECK_INTERVAL:-$DEFAULT_CHECK_INTERVAL}
+    CONSECUTIVE_CHECKS=${CONSECUTIVE_CHECKS:-$DEFAULT_CONSECUTIVE_CHECKS}
+    ALERT_INTERVAL=${ALERT_INTERVAL:-$DEFAULT_ALERT_INTERVAL}
+    LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-$DEFAULT_LOG_RETENTION_DAYS}
+}
+
+# Config'i yükle
+load_config
 
 # Dizinler
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ "$(uname)" = "Darwin" ] && LOG_DIR="$SCRIPT_DIR/logs" || LOG_DIR="/var/log/cpu-monitor"
 SUBSCRIBERS_FILE="$LOG_DIR/subscribers.txt"
 LAST_OFFSET_FILE="$LOG_DIR/last_offset.txt"
@@ -24,6 +96,18 @@ touch "$SUBSCRIBERS_FILE" "$LAST_OFFSET_FILE" 2>/dev/null
 # Log fonksiyonu
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_DIR/monitor.log" 2>/dev/null
+}
+
+# Eski logları temizle
+cleanup_old_logs() {
+    if [ -d "$LOG_DIR" ]; then
+        find "$LOG_DIR" -name "cpu_report_*.txt" -type f -mtime +$LOG_RETENTION_DAYS -delete 2>/dev/null
+        # Monitor log'unu da temizle (son X günü tut)
+        if [ -f "$LOG_DIR/monitor.log" ]; then
+            tail -n 10000 "$LOG_DIR/monitor.log" > "$LOG_DIR/monitor.log.tmp" 2>/dev/null
+            mv "$LOG_DIR/monitor.log.tmp" "$LOG_DIR/monitor.log" 2>/dev/null
+        fi
+    fi
 }
 
 # Telegram mesaj gönder
@@ -133,7 +217,6 @@ process_telegram_updates() {
     ! command -v jq >/dev/null 2>&1 && return 1
     
     local last_offset=$(cat "$LAST_OFFSET_FILE" 2>/dev/null || echo "0")
-    # Boş değer kontrolü ekle
     [ -z "$last_offset" ] && last_offset="0"
     
     local updates=$(curl -s --max-time 10 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=$last_offset&timeout=5" 2>&1)
@@ -163,28 +246,36 @@ process_telegram_updates() {
     while IFS='|' read -r update_id chat_id text; do
         [ -z "$update_id" ] || [ -z "$chat_id" ] || [ -z "$text" ] && continue
         
-        # Integer kontrolü ekle
         if [ -n "$update_id" ] && [ -n "$max_update_id" ]; then
             [ "$update_id" -gt "$max_update_id" ] 2>/dev/null && max_update_id=$update_id
         fi
         
-        # Secret key ile abonelik: /start SECRET_KEY veya /SECRET_KEY
+        # Secret key ile abonelik
         if [ "$text" = "/${SECRET_KEY}" ] || [ "$text" = "/start ${SECRET_KEY}" ]; then
             if ! grep -q "^${chat_id}$" "$SUBSCRIBERS_FILE" 2>/dev/null; then
                 echo "$chat_id" >> "$SUBSCRIBERS_FILE"
                 log "Yeni abone: $chat_id"
             fi
             
-            local response="✅ Abone oldunuz. CPU eşik değeri: ${CPU_THRESHOLD}%"
+            local response="✅ Abone oldunuz!
+
+📊 <b>Ayarlar:</b>
+• CPU Eşik: ${CPU_THRESHOLD}%
+• Kontrol Sayısı: ${CONSECUTIVE_CHECKS}x
+• Kontrol Aralığı: ${CHECK_INTERVAL}s
+• Bildirim Aralığı: ${ALERT_INTERVAL}s
+
+ℹ️ CPU ${CONSECUTIVE_CHECKS} kez üst üste ${CPU_THRESHOLD}% üzerine çıktığında bildirim alacaksınız. Eşik aşıldığı sürece her ${ALERT_INTERVAL} saniyede bir yeni rapor gönderilecek."
+            
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d chat_id="$chat_id" \
-                -d text="$response" >/dev/null 2>&1
+                -d text="$response" \
+                -d parse_mode="HTML" >/dev/null 2>&1
         fi
     done < "$temp_file"
     
     rm -f "$temp_file"
     
-    # Integer kontrolü ekle
     if [ -n "$max_update_id" ] && [ -n "$last_offset" ]; then
         [ "$max_update_id" -gt "$last_offset" ] 2>/dev/null && echo $((max_update_id + 1)) > "$LAST_OFFSET_FILE"
     fi
@@ -193,43 +284,62 @@ process_telegram_updates() {
 
 # Ana monitoring döngüsü
 main() {
-    [ -z "$TELEGRAM_BOT_TOKEN" ] && {
-        log "HATA: TELEGRAM_BOT_TOKEN ayarlanmamış"
-        exit 1
-    }
-    
-    log "CPU Monitor başlatıldı (Eşik: ${CPU_THRESHOLD}%)"
+    log "CPU Monitor başlatıldı"
+    log "Eşik: ${CPU_THRESHOLD}% | Kontrol: ${CONSECUTIVE_CHECKS}x | Aralık: ${CHECK_INTERVAL}s | Bildirim: ${ALERT_INTERVAL}s | Log Saklama: ${LOG_RETENTION_DAYS} gün"
     
     local consecutive_high=0
     local last_alert_time=0
+    local last_cleanup_day=$(date +%d)
     
     while true; do
         process_telegram_updates
+        
+        # Günlük log temizliği (günde bir kez)
+        local current_day=$(date +%d)
+        if [ "$current_day" != "$last_cleanup_day" ]; then
+            cleanup_old_logs
+            last_cleanup_day=$current_day
+            log "Eski loglar temizlendi (>${LOG_RETENTION_DAYS} gün)"
+        fi
         
         local cpu_usage=$(get_cpu_usage)
         local cpu_usage_int=${cpu_usage%.*}
         
         if [ "$cpu_usage_int" -ge "$CPU_THRESHOLD" ]; then
             consecutive_high=$((consecutive_high + 1))
+            log "CPU yüksek: ${cpu_usage}% (${consecutive_high}/${CONSECUTIVE_CHECKS})"
             
-            if [ $consecutive_high -ge 3 ]; then
+            # Eşik sayısına ulaşıldı mı?
+            if [ $consecutive_high -ge $CONSECUTIVE_CHECKS ]; then
                 local current_time=$(date +%s)
                 local time_since_alert=$((current_time - last_alert_time))
                 
-                if [ $time_since_alert -gt 300 ]; then
+                # İlk uyarı veya belirlenen süre geçti mi?
+                if [ $last_alert_time -eq 0 ] || [ $time_since_alert -ge $ALERT_INTERVAL ]; then
                     local report_file=$(create_report "$cpu_usage")
-                    local alert_msg="🚨 CPU Uyarısı: ${cpu_usage}% (Eşik: ${CPU_THRESHOLD}%)"
+                    local alert_msg="🚨 <b>CPU Uyarısı</b>
+
+📊 CPU Kullanımı: <b>${cpu_usage}%</b>
+⚠️ Eşik: ${CPU_THRESHOLD}%
+🔄 Üst üste: ${consecutive_high}x
+⏰ Zaman: $(date '+%H:%M:%S')
+
+💾 Detaylı rapor dosya olarak gönderiliyor..."
                     
                     send_telegram "$alert_msg"
-                    send_telegram_file "$report_file" "Detaylı CPU Raporu"
+                    send_telegram_file "$report_file" "📄 CPU Raporu - $(date '+%Y-%m-%d %H:%M:%S')"
                     
-                    log "Uyarı gönderildi: CPU ${cpu_usage}% (Rapor: $report_file)"
+                    log "⚠️  Uyarı gönderildi: CPU ${cpu_usage}% (${consecutive_high}x) - Rapor: $(basename $report_file)"
                     last_alert_time=$current_time
                 fi
-                consecutive_high=0
+                # consecutive_high'ı sıfırlama! Eşik geçildiği sürece rapor gönderilmeye devam etsin
             fi
         else
-            consecutive_high=0
+            # CPU normale döndü
+            if [ $consecutive_high -gt 0 ]; then
+                log "✓ CPU normale döndü: ${cpu_usage}% (önceki: ${consecutive_high}x yüksek)"
+                consecutive_high=0
+            fi
         fi
         
         sleep $CHECK_INTERVAL
