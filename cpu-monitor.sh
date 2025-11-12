@@ -21,7 +21,7 @@ DEFAULT_TELEGRAM_BOT_TOKEN=""
 # Config dosyasını oluştur veya oku
 create_default_config() {
     cat > "$CONFIG_FILE" << EOF
-# CPU Monitor Konfigürasyonuchmod +x cpu-monitor.sh
+# CPU Monitor Konfigürasyonu
 # Bu dosyayı düzenleyerek ayarları değiştirebilirsiniz
 
 # Telegram Bot Token (zorunlu)
@@ -226,7 +226,10 @@ process_telegram_updates() {
     local update_count=$(echo "$updates" | jq '.result | length' 2>/dev/null)
     [ -z "$update_count" ] || [ "$update_count" = "0" ] && return 0
     
-    local max_update_id=$last_offset
+    # Tüm update_id'leri topla
+    local max_update_id=$(echo "$updates" | jq -r '[.result[].update_id] | max // 0' 2>/dev/null)
+    [ -z "$max_update_id" ] && max_update_id="0"
+    
     local temp_file=$(mktemp)
     
     echo "$updates" | jq -r '.result[]? | 
@@ -236,28 +239,17 @@ process_telegram_updates() {
             "\(.update_id)|\(.edited_message.chat.id // "")|\(.edited_message.text // "")"
         else empty end' > "$temp_file" 2>/dev/null
     
-    [ ! -s "$temp_file" ] && {
-        local max_id=$(echo "$updates" | jq -r '[.result[].update_id] | max // 0' 2>/dev/null)
-        [ -n "$max_id" ] && [ "$max_id" -gt 0 ] && echo $((max_id + 1)) > "$LAST_OFFSET_FILE"
-        rm -f "$temp_file"
-        return 0
-    }
-    
-    while IFS='|' read -r update_id chat_id text; do
-        [ -z "$update_id" ] || [ -z "$chat_id" ] || [ -z "$text" ] && continue
-        
-        if [ -n "$update_id" ] && [ -n "$max_update_id" ]; then
-            [ "$update_id" -gt "$max_update_id" ] 2>/dev/null && max_update_id=$update_id
-        fi
-        
-        # Secret key ile abonelik
-        if [ "$text" = "/${SECRET_KEY}" ] || [ "$text" = "/start ${SECRET_KEY}" ]; then
-            if ! grep -q "^${chat_id}$" "$SUBSCRIBERS_FILE" 2>/dev/null; then
-                echo "$chat_id" >> "$SUBSCRIBERS_FILE"
-                log "Yeni abone: $chat_id"
-            fi
+    if [ -s "$temp_file" ]; then
+        while IFS='|' read -r update_id chat_id text; do
+            [ -z "$update_id" ] || [ -z "$chat_id" ] || [ -z "$text" ] && continue
             
-            local response="✅ Abone oldunuz!
+            # Secret key ile abonelik
+            if [ "$text" = "/${SECRET_KEY}" ] || [ "$text" = "/start ${SECRET_KEY}" ]; then
+                if ! grep -q "^${chat_id}$" "$SUBSCRIBERS_FILE" 2>/dev/null; then
+                    echo "$chat_id" >> "$SUBSCRIBERS_FILE"
+                    log "Yeni abone: $chat_id"
+                    
+                    local response="✅ Abone oldunuz!
 
 📊 <b>Ayarlar:</b>
 • CPU Eşik: ${CPU_THRESHOLD}%
@@ -266,19 +258,26 @@ process_telegram_updates() {
 • Bildirim Aralığı: ${ALERT_INTERVAL}s
 
 ℹ️ CPU ${CONSECUTIVE_CHECKS} kez üst üste ${CPU_THRESHOLD}% üzerine çıktığında bildirim alacaksınız. Eşik aşıldığı sürece her ${ALERT_INTERVAL} saniyede bir yeni rapor gönderilecek."
-            
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                -d chat_id="$chat_id" \
-                -d text="$response" \
-                -d parse_mode="HTML" >/dev/null 2>&1
-        fi
-    done < "$temp_file"
+                    
+                    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                        -d chat_id="$chat_id" \
+                        -d text="$response" \
+                        -d parse_mode="HTML" >/dev/null 2>&1
+                else
+                    log "Zaten abone: $chat_id (tekrar istek)"
+                fi
+            fi
+        done < "$temp_file"
+    fi
     
     rm -f "$temp_file"
     
-    if [ -n "$max_update_id" ] && [ -n "$last_offset" ]; then
-        [ "$max_update_id" -gt "$last_offset" ] 2>/dev/null && echo $((max_update_id + 1)) > "$LAST_OFFSET_FILE"
+    # Offset'i her zaman güncelle (mesaj olsun olmasın)
+    if [ -n "$max_update_id" ] && [ "$max_update_id" != "0" ]; then
+        local new_offset=$((max_update_id + 1))
+        echo "$new_offset" > "$LAST_OFFSET_FILE"
     fi
+    
     return 0
 }
 
