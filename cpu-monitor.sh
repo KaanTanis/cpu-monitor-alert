@@ -133,6 +133,9 @@ process_telegram_updates() {
     ! command -v jq >/dev/null 2>&1 && return 1
     
     local last_offset=$(cat "$LAST_OFFSET_FILE" 2>/dev/null || echo "0")
+    # Boş değer kontrolü ekle
+    [ -z "$last_offset" ] && last_offset="0"
+    
     local updates=$(curl -s --max-time 10 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=$last_offset&timeout=5" 2>&1)
     
     [ -z "$updates" ] || ! echo "$updates" | jq -e '.ok == true' >/dev/null 2>&1 && return 1
@@ -152,7 +155,7 @@ process_telegram_updates() {
     
     [ ! -s "$temp_file" ] && {
         local max_id=$(echo "$updates" | jq -r '[.result[].update_id] | max // 0' 2>/dev/null)
-        [ "$max_id" -gt 0 ] && echo $((max_id + 1)) > "$LAST_OFFSET_FILE"
+        [ -n "$max_id" ] && [ "$max_id" -gt 0 ] && echo $((max_id + 1)) > "$LAST_OFFSET_FILE"
         rm -f "$temp_file"
         return 0
     }
@@ -160,7 +163,10 @@ process_telegram_updates() {
     while IFS='|' read -r update_id chat_id text; do
         [ -z "$update_id" ] || [ -z "$chat_id" ] || [ -z "$text" ] && continue
         
-        [ "$update_id" -gt "$max_update_id" ] && max_update_id=$update_id
+        # Integer kontrolü ekle
+        if [ -n "$update_id" ] && [ -n "$max_update_id" ]; then
+            [ "$update_id" -gt "$max_update_id" ] 2>/dev/null && max_update_id=$update_id
+        fi
         
         # Secret key ile abonelik: /start SECRET_KEY veya /SECRET_KEY
         if [ "$text" = "/${SECRET_KEY}" ] || [ "$text" = "/start ${SECRET_KEY}" ]; then
@@ -178,7 +184,10 @@ process_telegram_updates() {
     
     rm -f "$temp_file"
     
-    [ "$max_update_id" -gt "$last_offset" ] && echo $((max_update_id + 1)) > "$LAST_OFFSET_FILE"
+    # Integer kontrolü ekle
+    if [ -n "$max_update_id" ] && [ -n "$last_offset" ]; then
+        [ "$max_update_id" -gt "$last_offset" ] 2>/dev/null && echo $((max_update_id + 1)) > "$LAST_OFFSET_FILE"
+    fi
     return 0
 }
 
