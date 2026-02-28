@@ -154,6 +154,28 @@ create_report() {
     local cpu_usage="$1"
     
     {
+        echo "--- TOP 20 REQUEST IP (nginx) ---"
+        grep -h "" /var/log/nginx/*access.log 2>/dev/null | \
+        awk '{print $1}' | sort | uniq -c | sort -nr | head -20
+        echo ""
+        echo "--- TOP 20 REQUESTED URL ---"
+        grep -h "" /var/log/nginx/*access.log 2>/dev/null | \
+        awk '{print $7}' | sort | uniq -c | sort -nr | head -20
+        echo ""
+        echo "--- TOP USER AGENTS ---"
+        grep -h "" /var/log/nginx/*access.log 2>/dev/null | \
+        awk -F\" '{print $6}' | sort | uniq -c | sort -nr | head -20
+        echo ""
+        echo "--- 404 COUNT (last 10000 lines) ---"
+        tail -n 10000 /var/log/nginx/access.log 2>/dev/null | \
+        grep " 404 " | wc -l
+        echo ""
+        echo "--- PHP-FPM PROCESS COUNT ---"
+        ps aux | grep php-fpm | grep -v grep | wc -l
+        echo ""
+        echo "--- SUSPICIOUS IPs (>1000 req) ---"
+        grep -h "" /var/log/nginx/*access.log 2>/dev/null | \
+        awk '{print $1}' | sort | uniq -c | awk '$1 > 1000' | sort -nr
         echo "=========================================="
         echo "CPU SPIKE REPORT"
         echo "Time: $(date)"
